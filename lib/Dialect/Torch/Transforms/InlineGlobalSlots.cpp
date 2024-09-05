@@ -50,7 +50,7 @@ using namespace mlir::torch::Torch;
 /// would probably want to go through the effort to indirect through the symbol
 /// tables to make things clearer.
 class FlatSymbolRefProgramPoint
-    : public GenericProgramPointBase<FlatSymbolRefProgramPoint,
+    : public GenericLatticeAnchorBase<FlatSymbolRefProgramPoint,
                                      FlatSymbolRefAttr> {
 public:
   using Base::Base;
@@ -93,7 +93,7 @@ static bool isUseTreatedWithValueSemantics(OpOperand &use) {
 ///   unsafe
 class InlineGlobalSlotsAnalysisState : public AnalysisState {
 public:
-  InlineGlobalSlotsAnalysisState(ProgramPoint point) : AnalysisState(point) {
+  InlineGlobalSlotsAnalysisState(LatticeAnchor anchor) : AnalysisState(anchor) {
     (void)setSafe();
   }
 
@@ -147,14 +147,14 @@ private:
 
 InlineGlobalSlotsAnalysis::InlineGlobalSlotsAnalysis(DataFlowSolver &solver)
     : DataFlowAnalysis(solver) {
-  registerPointKind<FlatSymbolRefProgramPoint>();
+  registerAnchorKind<FlatSymbolRefProgramPoint>();
 }
 
 LogicalResult InlineGlobalSlotsAnalysis::initialize(Operation *top) {
   auto walkResult = top->walk([this](Operation *op) {
     if (auto globalSlot = dyn_cast<Torch::GlobalSlotOp>(op)) {
       auto *state = getOrCreate<InlineGlobalSlotsAnalysisState>(
-          getProgramPoint<FlatSymbolRefProgramPoint>(
+          getLatticeAnchor<FlatSymbolRefProgramPoint>(
               FlatSymbolRefAttr::get(globalSlot.getSymNameAttr())));
       propagateIfChanged(state,
                          state->setSafe(globalSlot.getVisibility() !=
@@ -162,7 +162,7 @@ LogicalResult InlineGlobalSlotsAnalysis::initialize(Operation *top) {
     }
     if (auto globalSlotSet = dyn_cast<Torch::GlobalSlotSetOp>(op)) {
       auto *state = getOrCreate<InlineGlobalSlotsAnalysisState>(
-          getProgramPoint<FlatSymbolRefProgramPoint>(
+          getLatticeAnchor<FlatSymbolRefProgramPoint>(
               globalSlotSet.getSlotAttr()));
       propagateIfChanged(state, state->setSafe(false));
     }
@@ -170,10 +170,12 @@ LogicalResult InlineGlobalSlotsAnalysis::initialize(Operation *top) {
     if (auto initialize = dyn_cast<Torch::InitializeGlobalSlotsOp>(op)) {
       initializeGlobalSlotsOp = initialize;
     }
-    for (Value result : op->getResults()) {
-      if (failed(visit(result)))
+    // TODO: Looped over results here before. Probably need totake care in
+    //       case of multiple results either in visit() or in somewhere else.z
+    // for (Value result : op->getResults()) {
+      if (failed(visit(op)))
         return WalkResult::interrupt();
-    }
+    // }
     return WalkResult::advance();
   });
   if (walkResult.wasInterrupted())
@@ -182,28 +184,42 @@ LogicalResult InlineGlobalSlotsAnalysis::initialize(Operation *top) {
 }
 
 LogicalResult InlineGlobalSlotsAnalysis::visit(ProgramPoint point) {
-  if (Value value = dyn_cast<Value>(point)) {
+  // if (Value value = dyn_cast<Value>(point)) {
+  if (Operation *op = dyn_cast<Operation *>(point)) {
+    // TODO: Got a value before and looked up the owning op. Getting the op now and looking up the value.
+    //       `initialize()` looped over the result values, thus we probably need to take care of multiple results somewhere.
+    if (op->getNumResults() != 1)
+      return failure();
+
+    Value value = op->getResult(0);
+
     bool isSafe = isValueSafeTransferFunction(value);
     auto *state = getOrCreate<InlineGlobalSlotsAnalysisState>(value);
     propagateIfChanged(state, state->setSafe(isSafe));
 
     // Handle GlobalSlotGetOp's.
-    if (auto opResult = dyn_cast<OpResult>(value)) {
+    // if (auto opResult = dyn_cast<OpResult>(value)) {
+    //   if (auto globalSlotGet =
+    //           dyn_cast<Torch::GlobalSlotGetOp>(opResult.getOwner())) {
       if (auto globalSlotGet =
-              dyn_cast<Torch::GlobalSlotGetOp>(opResult.getOwner())) {
-        auto *flatSymbolRefPoint = getProgramPoint<FlatSymbolRefProgramPoint>(
+              dyn_cast<Torch::GlobalSlotGetOp>(op)) {
+        auto *flatSymbolRefPoint = getLatticeAnchor<FlatSymbolRefProgramPoint>(
             globalSlotGet.getSlotAttr());
         auto *valueState = getOrCreateFor<InlineGlobalSlotsAnalysisState>(
-            flatSymbolRefPoint, globalSlotGet.getResult());
-        auto *globalState =
-            getOrCreate<InlineGlobalSlotsAnalysisState>(flatSymbolRefPoint);
+            // flatSymbolRefPoint, globalSlotGet.getResult());
+            globalSlotGet, globalSlotGet.getResult());
+         auto *globalState =
+             getOrCreate<InlineGlobalSlotsAnalysisState>(flatSymbolRefPoint);
         propagateIfChanged(globalState,
                            globalState->incorporateSafetyOfUse(valueState));
       }
-    }
+    // }
 
     return success();
   }
+
+  // TODO: Fix me
+  /*
   if (auto *genericProgramPoint = dyn_cast<GenericProgramPoint *>(point)) {
     if (auto *flatSymbolRefPoint =
             dyn_cast<FlatSymbolRefProgramPoint>(genericProgramPoint)) {
@@ -225,6 +241,7 @@ LogicalResult InlineGlobalSlotsAnalysis::visit(ProgramPoint point) {
   }
   LLVM_DEBUG(
       { llvm::dbgs() << "visit failing because of: " << point << "\n"; });
+  */
   return failure();
 }
 
@@ -242,7 +259,8 @@ bool InlineGlobalSlotsAnalysis::isValueSafeTransferFunction(Value value) {
     if ((op->hasTrait<Torch::OpTrait::ReadOnly>() || isMemoryEffectFree(op)) &&
         llvm::all_of(op->getResults(), [&](Value result) {
           auto *state =
-              getOrCreateFor<InlineGlobalSlotsAnalysisState>(value, result);
+              // getOrCreateFor<InlineGlobalSlotsAnalysisState>(value, result);
+              getOrCreateFor<InlineGlobalSlotsAnalysisState>(op, result);
           return state->isSafe;
         }))
       continue;
@@ -250,7 +268,8 @@ bool InlineGlobalSlotsAnalysis::isValueSafeTransferFunction(Value value) {
       auto symName = cast<FlatSymbolRefAttr>(
           initialize.getSlotSymNames()[use.getOperandNumber()]);
       auto *state = getOrCreateFor<InlineGlobalSlotsAnalysisState>(
-          value, getProgramPoint<FlatSymbolRefProgramPoint>(symName));
+          // value, getProgramPoint<FlatSymbolRefProgramPoint>(symName));
+          op, getLatticeAnchor<FlatSymbolRefProgramPoint>(symName));
       if (state->isSafe)
         continue;
     }
@@ -299,7 +318,7 @@ class InlineGlobalSlotsPass
       module->walk([&](Operation *op) {
         if (auto globalSlot = dyn_cast<Torch::GlobalSlotOp>(op)) {
           auto *state = solver.lookupState<InlineGlobalSlotsAnalysisState>(
-              solver.getProgramPoint<FlatSymbolRefProgramPoint>(
+              solver.getLatticeAnchor<FlatSymbolRefProgramPoint>(
                   FlatSymbolRefAttr::get(globalSlot.getSymNameAttr())));
           state->print(llvm::dbgs());
           llvm::dbgs() << ": "
@@ -334,7 +353,7 @@ class InlineGlobalSlotsPass
       auto slotSymName =
           cast<FlatSymbolRefAttr>(initialize.getSlotSymNames()[i]);
       Value operand = initialize.getOperand(i);
-      auto symbolRefPoint = solver.getProgramPoint<FlatSymbolRefProgramPoint>(
+      auto symbolRefPoint = solver.getLatticeAnchor<FlatSymbolRefProgramPoint>(
           cast<FlatSymbolRefAttr>(initialize.getSlotSymNames()[i]));
       auto *state =
           solver.lookupState<InlineGlobalSlotsAnalysisState>(symbolRefPoint);
